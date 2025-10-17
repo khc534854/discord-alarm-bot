@@ -345,6 +345,27 @@ async def alarm_daily_list(interaction: discord.Interaction):
         lines.append(f"`#{rid}` {h:02d}:{m:02d} [{status}] {tag} - {msg} (last_sent={last_sent or '-'})")
 
     await interaction.response.send_message("**매일 알람 목록**\n" + "\n".join(lines), ephemeral=True)
+    
+@client.tree.command(
+    name="alarm_daily_cancel",
+    description="등록한 매일 알람 중 특정 ID를 취소합니다. /alarm_daily_list 로 ID를 확인하세요."
+)
+@app_commands.describe(alarm_id="취소할 매일 알람의 ID")
+async def alarm_daily_cancel(interaction: discord.Interaction, alarm_id: int):
+    async with aiosqlite.connect(client.db_path) as db:
+        await db.execute("""
+            UPDATE recurring_alarms
+            SET enabled = 0
+            WHERE id = ? AND user_id = ? AND guild_id = ? AND enabled = 1
+        """, (alarm_id, interaction.user.id, interaction.guild_id))
+        changes = db.total_changes
+        await db.commit()
+
+    if changes == 0:
+        await interaction.response.send_message("해당 ID의 활성화된 매일 알람이 없습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"매일 알람 #{alarm_id} 을(를) 취소했습니다.", ephemeral=True)
+    
 
 # ── 실행 ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

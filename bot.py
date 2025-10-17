@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 import aiosqlite
 
 # --- 환경 ---
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+load_dotenv(override=True)
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Seoul"))
 
 INTENTS = discord.Intents.default()
@@ -46,10 +46,10 @@ class AlarmBot(discord.Client):
             """)
             await db.commit()
 
-    @tasks.loop(seconds=15)
+    @tasks.loop(seconds=60)
     async def check_alarms(self):
-        # 15초마다 DB에서 만기 알람을 찾아 전송
-        now_utc = datetime.utcnow()
+        # 권장 방식: 타임존 인식 UTC now
+        now_utc = datetime.now(UTC)
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("""
                 SELECT id, guild_id, channel_id, user_id, run_at, message
@@ -60,7 +60,11 @@ class AlarmBot(discord.Client):
 
             to_send = []
             for rid, guild_id, channel_id, user_id, run_at, message in rows:
-                run_dt = datetime.fromisoformat(run_at)  # UTC
+                run_dt = datetime.fromisoformat(run_at)
+                # run_at이 tz 미포함으로 저장된 예외 상황 대비
+                if run_dt.tzinfo is None:
+                    run_dt = run_dt.replace(tzinfo=UTC)
+
                 if run_dt <= now_utc:
                     to_send.append((rid, guild_id, channel_id, user_id, message))
 
@@ -168,8 +172,10 @@ async def alarms(interaction: discord.Interaction):
 
     lines = []
     for rid, run_at, message in rows:
-        # UTC → 서울
-        run_local = datetime.fromisoformat(run_at).replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+        run_dt = datetime.fromisoformat(run_at)
+        if run_dt.tzinfo is None:
+            run_dt = run_dt.replace(tzinfo=UTC)
+        run_local = run_dt.astimezone(TZ)
         lines.append(f"`#{rid}`  {run_local.strftime('%Y-%m-%d %H:%M:%S')}  - {message}")
 
     await interaction.response.send_message("**등록된 알람**\n" + "\n".join(lines), ephemeral=True)

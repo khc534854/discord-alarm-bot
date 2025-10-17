@@ -13,10 +13,10 @@ import aiosqlite
 load_dotenv(override=True)
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Seoul"))
-UTC = ZoneInfo("UTC")  # Python 3.13 환경 호환
+UTC = ZoneInfo("UTC")  # Python 3.13 호환
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True  # 메시지 콘텐츠 인텐트
+INTENTS.message_content = True  # 슬래시 명령 외 텍스트 접근 필요 시
 
 # ── 클라이언트 ──────────────────────────────────────────────────────────────
 class AlarmBot(discord.Client):
@@ -58,6 +58,11 @@ class AlarmBot(discord.Client):
                     last_sent_local_date TEXT   -- 'YYYY-MM-DD' (TZ 기준)
                 );
             """)
+            # 마이그레이션: @everyone 사용 여부
+            try:
+                await db.execute("ALTER TABLE recurring_alarms ADD COLUMN ping_everyone INTEGER DEFAULT 0;")
+            except Exception:
+                pass
             await db.commit()
 
     @tasks.loop(seconds=60)
@@ -98,22 +103,26 @@ class AlarmBot(discord.Client):
             # ── 반복 알람(매일 HH:MM) 처리 ──────────────────────────────────
             async with db.execute("""
                 SELECT id, guild_id, channel_id, user_id, at_hour, at_minute, message,
-                       enabled, COALESCE(last_sent_local_date, '')
+                       enabled, COALESCE(last_sent_local_date, ''), COALESCE(ping_everyone, 0)
                 FROM recurring_alarms
                 WHERE enabled = 1
             """) as rc:
                 rrows = await rc.fetchall()
 
-            for rid, guild_id, channel_id, user_id, at_hour, at_minute, message, enabled, last_sent in rrows:
+            for rid, guild_id, channel_id, user_id, at_hour, at_minute, message, enabled, last_sent, ping_everyone in rrows:
                 target_local = now_local.replace(hour=at_hour, minute=at_minute, second=0, microsecond=0)
                 # 오늘 아직 발송 안 했고, 목표 시각이 지났으면 발송
                 if last_sent != today_str and now_local >= target_local:
                     channel = self.get_channel(channel_id)
                     if channel:
                         try:
-                            await channel.send(
-                                f"<@{user_id}> 알람(매일 {at_hour:02d}:{at_minute:02d}): {message}"
-                            )
+                            if int(ping_everyone) == 1:
+                                text = f"@everyone 알람(매일 {at_hour:02d}:{at_minute:02d}) : {message}"
+                                allowed = discord.AllowedMentions(everyone=True, users=False, roles=False)
+                            else:
+                                text = f"<@{user_id}> 알람(매일 {at_hour:02d}:{at_minute:02d}) : {message}"
+                                allowed = discord.AllowedMentions(everyone=False, users=True, roles=False)
+                            await channel.send(text, allowed_mentions=allowed)
                         except Exception as e:
                             print(f"Recurring send failed (id {rid}): {e}")
                     await db.execute("""
@@ -136,7 +145,7 @@ client = AlarmBot()
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! {round(client.latency * 1000)}ms", ephemeral=True)
 
-# ── 명령어: 일회성 알람 등록(분 뒤) ────────────────────────────────────────
+# ── 명령어: 일회성 알람(분 뒤) ─────────────────────────────────────────────
 @client.tree.command(name="alarm_in", description="지금부터 N분 뒤 알람을 등록합니다.")
 @app_commands.describe(minutes="몇 분 뒤?", message="알람 메시지")
 async def alarm_in(interaction: discord.Interaction, minutes: int, message: str):
@@ -159,7 +168,7 @@ async def alarm_in(interaction: discord.Interaction, minutes: int, message: str)
         ephemeral=True
     )
 
-# ── 명령어: 일회성 알람 등록(특정 시각) ────────────────────────────────────
+# ── 명령어: 일회성 알람(특정 시각) ─────────────────────────────────────────
 @client.tree.command(name="alarm_at", description="특정 시각(Asia/Seoul)에 알람을 등록합니다. 예: 2025-10-17 15:30")
 @app_commands.describe(when="예: 2025-10-17 15:30", message="알람 메시지")
 async def alarm_at(interaction: discord.Interaction, when: str, message: str):
@@ -228,22 +237,42 @@ async def alarm_cancel(interaction: discord.Interaction, alarm_id: int):
     else:
         await interaction.response.send_message(f"알람 #{alarm_id} 취소 완료.", ephemeral=True)
 
-# ── 명령어: 매일 20:00 등록/해제/목록 ─────────────────────────────────────
+# ── 명령어: 매일 20:00(일반) ──────────────────────────────────────────────
 @client.tree.command(name="alarm_daily20", description="매일 20:00(Asia/Seoul) 알람을 현재 채널에 등록합니다.")
 @app_commands.describe(message="알람 메시지")
 async def alarm_daily20(interaction: discord.Interaction, message: str):
     async with aiosqlite.connect(client.db_path) as db:
         await db.execute("""
-            INSERT INTO recurring_alarms (guild_id, channel_id, user_id, at_hour, at_minute, message, enabled, last_sent_local_date)
-            VALUES (?, ?, ?, 20, 0, ?, 1, NULL)
+            INSERT INTO recurring_alarms
+                (guild_id, channel_id, user_id, at_hour, at_minute, message, enabled, last_sent_local_date, ping_everyone)
+            VALUES (?, ?, ?, 20, 0, ?, 1, NULL, 0)
         """, (interaction.guild_id, interaction.channel_id, interaction.user.id, message))
         await db.commit()
+    await interaction.response.send_message("매일 **20:00 (Asia/Seoul)** 알람을 등록했습니다.", ephemeral=True)
 
-    await interaction.response.send_message(
-        "매일 **20:00 (Asia/Seoul)** 알람을 등록했습니다. 이 채널로 알림이 전송됩니다.",
-        ephemeral=True
-    )
+# ── 명령어: 매일 20:00(@everyone) ─────────────────────────────────────────
+@client.tree.command(
+    name="alarm_daily20_everyone",
+    description="매일 20:00(Asia/Seoul) @everyone 알람을 현재 채널에 등록합니다."
+)
+@app_commands.describe(message="알람 메시지")
+async def alarm_daily20_everyone(interaction: discord.Interaction, message: str):
+    # 채널 권한 점검(권한 없으면 발송 시 실패)
+    perms = interaction.channel.permissions_for(interaction.guild.me) if interaction.guild and interaction.channel else None
+    if perms is not None and not perms.mention_everyone:
+        await interaction.response.send_message("이 채널에서 봇에게 `@everyone` 언급 권한이 없습니다.", ephemeral=True)
+        return
 
+    async with aiosqlite.connect(client.db_path) as db:
+        await db.execute("""
+            INSERT INTO recurring_alarms
+                (guild_id, channel_id, user_id, at_hour, at_minute, message, enabled, last_sent_local_date, ping_everyone)
+            VALUES (?, ?, ?, 20, 0, ?, 1, NULL, 1)
+        """, (interaction.guild_id, interaction.channel_id, interaction.user.id, message))
+        await db.commit()
+    await interaction.response.send_message("매일 **20:00** `@everyone` 알람을 등록했습니다.", ephemeral=True)
+
+# ── 명령어: 매일 20:00 해제 ────────────────────────────────────────────────
 @client.tree.command(name="alarm_daily20_cancel", description="매일 20:00(Asia/Seoul) 알람을 해제합니다.")
 async def alarm_daily20_cancel(interaction: discord.Interaction):
     async with aiosqlite.connect(client.db_path) as db:
@@ -260,11 +289,13 @@ async def alarm_daily20_cancel(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("매일 20:00 알람을 해제했습니다.", ephemeral=True)
 
+# ── 명령어: 매일 알람 목록 ────────────────────────────────────────────────
 @client.tree.command(name="alarm_daily_list", description="내가 등록한 매일 알람을 확인합니다.")
 async def alarm_daily_list(interaction: discord.Interaction):
     async with aiosqlite.connect(client.db_path) as db:
         async with db.execute("""
-            SELECT id, at_hour, at_minute, message, enabled, COALESCE(last_sent_local_date,'')
+            SELECT id, at_hour, at_minute, message, enabled,
+                   COALESCE(last_sent_local_date,''), COALESCE(ping_everyone,0)
             FROM recurring_alarms
             WHERE guild_id = ? AND user_id = ?
             ORDER BY at_hour, at_minute, id
@@ -276,9 +307,10 @@ async def alarm_daily_list(interaction: discord.Interaction):
         return
 
     lines = []
-    for rid, h, m, msg, enabled, last_sent in rows:
+    for rid, h, m, msg, enabled, last_sent, ping_everyone in rows:
         status = "ON" if enabled else "OFF"
-        lines.append(f"`#{rid}` {h:02d}:{m:02d} [{status}] - {msg} (last_sent={last_sent or '-'})")
+        tag = "@everyone" if int(ping_everyone) == 1 else ""
+        lines.append(f"`#{rid}` {h:02d}:{m:02d} [{status}] {tag} - {msg} (last_sent={last_sent or '-'})")
 
     await interaction.response.send_message("**매일 알람 목록**\n" + "\n".join(lines), ephemeral=True)
 

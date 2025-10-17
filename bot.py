@@ -16,7 +16,7 @@ TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Seoul"))
 UTC = ZoneInfo("UTC")  # Python 3.13 호환
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True  # 슬래시 명령 외 텍스트 접근 필요 시
+INTENTS.message_content = True  # 메시지 콘텐츠 인텐트(필요 시)
 
 # ── 클라이언트 ──────────────────────────────────────────────────────────────
 class AlarmBot(discord.Client):
@@ -58,7 +58,7 @@ class AlarmBot(discord.Client):
                     last_sent_local_date TEXT   -- 'YYYY-MM-DD' (TZ 기준)
                 );
             """)
-            # 마이그레이션: @everyone 사용 여부
+            # 마이그레이션: @everyone 사용 여부 컬럼
             try:
                 await db.execute("ALTER TABLE recurring_alarms ADD COLUMN ping_everyone INTEGER DEFAULT 0;")
             except Exception:
@@ -237,7 +237,7 @@ async def alarm_cancel(interaction: discord.Interaction, alarm_id: int):
     else:
         await interaction.response.send_message(f"알람 #{alarm_id} 취소 완료.", ephemeral=True)
 
-# ── 명령어: 매일 20:00(일반) ──────────────────────────────────────────────
+# ── 명령어: 매일 20:00(개인 멘션) ─────────────────────────────────────────
 @client.tree.command(name="alarm_daily20", description="매일 20:00(Asia/Seoul) 알람을 현재 채널에 등록합니다.")
 @app_commands.describe(message="알람 메시지")
 async def alarm_daily20(interaction: discord.Interaction, message: str):
@@ -257,7 +257,6 @@ async def alarm_daily20(interaction: discord.Interaction, message: str):
 )
 @app_commands.describe(message="알람 메시지")
 async def alarm_daily20_everyone(interaction: discord.Interaction, message: str):
-    # 채널 권한 점검(권한 없으면 발송 시 실패)
     perms = interaction.channel.permissions_for(interaction.guild.me) if interaction.guild and interaction.channel else None
     if perms is not None and not perms.mention_everyone:
         await interaction.response.send_message("이 채널에서 봇에게 `@everyone` 언급 권한이 없습니다.", ephemeral=True)
@@ -272,7 +271,40 @@ async def alarm_daily20_everyone(interaction: discord.Interaction, message: str)
         await db.commit()
     await interaction.response.send_message("매일 **20:00** `@everyone` 알람을 등록했습니다.", ephemeral=True)
 
-# ── 명령어: 매일 20:00 해제 ────────────────────────────────────────────────
+# ── 명령어: 매일 N시 M분 @everyone(커스텀 시각) ───────────────────────────
+@client.tree.command(
+    name="alarm_daily_everyone",
+    description="매일 지정한 시각(Asia/Seoul)에 @everyone 알람을 등록합니다. 예: /alarm_daily_everyone time:21:30 message:테스트"
+)
+@app_commands.describe(time="시각 (HH:MM 형식, 예: 21:30)", message="알람 메시지")
+async def alarm_daily_everyone(interaction: discord.Interaction, time: str, message: str):
+    perms = interaction.channel.permissions_for(interaction.guild.me) if interaction.guild and interaction.channel else None
+    if perms is not None and not perms.mention_everyone:
+        await interaction.response.send_message("이 채널에서 봇에게 `@everyone` 언급 권한이 없습니다.", ephemeral=True)
+        return
+
+    try:
+        hour, minute = map(int, time.split(":"))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError:
+        await interaction.response.send_message("시간 형식이 올바르지 않습니다. 예: 08:30 또는 23:00", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(client.db_path) as db:
+        await db.execute("""
+            INSERT INTO recurring_alarms
+                (guild_id, channel_id, user_id, at_hour, at_minute, message, enabled, last_sent_local_date, ping_everyone)
+            VALUES (?, ?, ?, ?, ?, ?, 1, NULL, 1)
+        """, (interaction.guild_id, interaction.channel_id, interaction.user.id, hour, minute, message))
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"매일 **{hour:02d}:{minute:02d} (Asia/Seoul)** `@everyone` 알람을 등록했습니다.",
+        ephemeral=True
+    )
+
+# ── 명령어: 매일 알람 해제(20:00 고정) ────────────────────────────────────
 @client.tree.command(name="alarm_daily20_cancel", description="매일 20:00(Asia/Seoul) 알람을 해제합니다.")
 async def alarm_daily20_cancel(interaction: discord.Interaction):
     async with aiosqlite.connect(client.db_path) as db:

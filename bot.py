@@ -9,10 +9,14 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 import aiosqlite
 
+
+
 # --- 환경 ---
 load_dotenv(override=True)
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Seoul"))
+
+UTC = ZoneInfo("UTC")   # ✅ 이 한 줄 추가
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True  # /commands는 없어도 되지만, 예비용으로 켭니다.

@@ -65,9 +65,45 @@ class AlarmBot(discord.Client):
                 pass
             await db.commit()
 
-    @tasks.loop(seconds=60)
+    # ── 전송 유틸: 채널 해소 & 안전 전송(재시도) ─────────────────────────────
+    async def _resolve_channel(self, channel_id: int):
+        ch = self.get_channel(channel_id)
+        if ch is None:
+            try:
+                ch = await self.fetch_channel(channel_id)  # 캐시 미스 대비
+            except Exception as e:
+                print(f"[WARN] fetch_channel({channel_id}) 실패: {e}")
+                return None
+        return ch
+
+    async def _safe_send(self, channel: discord.abc.Messageable, content: str,
+                         *, allowed_mentions: discord.AllowedMentions | None = None,
+                         max_retries: int = 3) -> bool:
+        delay = 1.0
+        for attempt in range(1, max_retries + 1):
+            try:
+                await channel.send(content, allowed_mentions=allowed_mentions)
+                return True
+            except discord.Forbidden as e:
+                # 권한 문제는 재시도해도 의미 없음 → 즉시 중단
+                print(f"[ERROR] send Forbidden(권한) attempt={attempt}: {e}")
+                return False
+            except discord.NotFound as e:
+                # 채널/길드가 사라짐 → 즉시 중단
+                print(f"[ERROR] send NotFound attempt={attempt}: {e}")
+                return False
+            except Exception as e:
+                print(f"[WARN] send 실패 attempt={attempt}: {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    return False
+
+    # ── 알람 루프 ────────────────────────────────────────────────────────────
+    @tasks.loop(seconds=30)
     async def check_alarms(self):
-        """일회성 + 반복 알람 전송 루프(60초 간격)."""
+        """일회성 + 반복 알람 전송 루프(30초 간격). 성공 시에만 완료 처리."""
         now_utc = datetime.now(UTC)
         now_local = now_utc.astimezone(TZ)
         today_str = now_local.strftime("%Y-%m-%d")
@@ -81,24 +117,30 @@ class AlarmBot(discord.Client):
             """) as cursor:
                 rows = await cursor.fetchall()
 
-            to_send_once = []
             for rid, guild_id, channel_id, user_id, run_at, message in rows:
                 run_dt = datetime.fromisoformat(run_at)
                 if run_dt.tzinfo is None:
                     run_dt = run_dt.replace(tzinfo=UTC)
-                if run_dt <= now_utc:
-                    to_send_once.append((rid, guild_id, channel_id, user_id, message))
+                if run_dt > now_utc:
+                    continue
 
-            for rid, guild_id, channel_id, user_id, message in to_send_once:
-                channel = self.get_channel(channel_id)
+                channel = await self._resolve_channel(channel_id)
+                sent_ok = False
                 if channel:
                     try:
-                        await channel.send(f"<@{user_id}> 알람: {message}")
+                        content = f"<@{user_id}> 알람: {message}"
+                        sent_ok = await self._safe_send(channel, content)
                     except Exception as e:
-                        print(f"Send failed (alarm {rid}): {e}")
-                await db.execute("UPDATE alarms SET sent = 1 WHERE id = ?", (rid,))
-            if to_send_once:
-                await db.commit()
+                        print(f"[ERROR] 일회성 알람 #{rid} 전송 중 예외: {e}")
+                else:
+                    print(f"[WARN] 일회성 알람 #{rid}: 채널 {channel_id} 해소 실패")
+
+                if sent_ok:
+                    await db.execute("UPDATE alarms SET sent = 1 WHERE id = ?", (rid,))
+                else:
+                    # 실패 시 sent=0 유지 → 다음 루프에서 재시도
+                    print(f"[INFO] 일회성 알람 #{rid} 재시도 예정")
+            await db.commit()
 
             # ── 반복 알람(매일 HH:MM) 처리 ──────────────────────────────────
             async with db.execute("""
@@ -110,27 +152,36 @@ class AlarmBot(discord.Client):
                 rrows = await rc.fetchall()
 
             for rid, guild_id, channel_id, user_id, at_hour, at_minute, message, enabled, last_sent, ping_everyone in rrows:
+                # 목표 시각(로컬) 계산
                 target_local = now_local.replace(hour=at_hour, minute=at_minute, second=0, microsecond=0)
-                # 오늘 아직 발송 안 했고, 목표 시각이 지났으면 발송
-                if last_sent != today_str and now_local >= target_local:
-                    channel = self.get_channel(channel_id)
-                    if channel:
-                        try:
-                            if int(ping_everyone) == 1:
-                                text = f"@everyone 알람(매일 {at_hour:02d}:{at_minute:02d}) : {message}"
-                                allowed = discord.AllowedMentions(everyone=True, users=False, roles=False)
-                            else:
-                                text = f"<@{user_id}> 알람(매일 {at_hour:02d}:{at_minute:02d}) : {message}"
-                                allowed = discord.AllowedMentions(everyone=False, users=True, roles=False)
-                            await channel.send(text, allowed_mentions=allowed)
-                        except Exception as e:
-                            print(f"Recurring send failed (id {rid}): {e}")
+
+                # 최대 지연 허용(루프 지터 보정): 목표 시각을 지났다면 오늘 1회 발송
+                if last_sent == today_str or now_local < target_local:
+                    continue
+
+                channel = await self._resolve_channel(channel_id)
+                sent_ok = False
+                if channel:
+                    if int(ping_everyone) == 1:
+                        text = f"@everyone 알람(매일 {at_hour:02d}:{at_minute:02d}) : {message}"
+                        allowed = discord.AllowedMentions(everyone=True, users=False, roles=False)
+                    else:
+                        text = f"<@{user_id}> 알람(매일 {at_hour:02d}:{at_minute:02d}) : {message}"
+                        allowed = discord.AllowedMentions(everyone=False, users=True, roles=False)
+
+                    sent_ok = await self._safe_send(channel, text, allowed_mentions=allowed)
+                else:
+                    print(f"[WARN] 반복 알람 #{rid}: 채널 {channel_id} 해소 실패")
+
+                if sent_ok:
                     await db.execute("""
                         UPDATE recurring_alarms
                         SET last_sent_local_date = ?
                         WHERE id = ?
                     """, (today_str, rid))
-
+                else:
+                    # 실패 시 날짜 갱신 안 함 → 같은 날 계속 재시도
+                    print(f"[INFO] 반복 알람 #{rid} 전송 실패 → 오늘 재시도")
             await db.commit()
 
     @check_alarms.before_loop
@@ -345,7 +396,8 @@ async def alarm_daily_list(interaction: discord.Interaction):
         lines.append(f"`#{rid}` {h:02d}:{m:02d} [{status}] {tag} - {msg} (last_sent={last_sent or '-'})")
 
     await interaction.response.send_message("**매일 알람 목록**\n" + "\n".join(lines), ephemeral=True)
-    
+
+# ── 명령어: 매일 알람 개별 취소(커스텀 포함) ───────────────────────────────
 @client.tree.command(
     name="alarm_daily_cancel",
     description="등록한 매일 알람 중 특정 ID를 취소합니다. /alarm_daily_list 로 ID를 확인하세요."
@@ -365,7 +417,6 @@ async def alarm_daily_cancel(interaction: discord.Interaction, alarm_id: int):
         await interaction.response.send_message("해당 ID의 활성화된 매일 알람이 없습니다.", ephemeral=True)
     else:
         await interaction.response.send_message(f"매일 알람 #{alarm_id} 을(를) 취소했습니다.", ephemeral=True)
-    
 
 # ── 실행 ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
